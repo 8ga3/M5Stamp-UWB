@@ -1,0 +1,47 @@
+#######################################
+# Syntax Coloring Map For M5Stamp_UWB
+#######################################
+
+M5Stamp_UWB	KEYWORD1
+M5Stamp_UWBConfig	KEYWORD1
+M5Stamp_UWBPHYConfig	KEYWORD1
+M5Stamp_UWBFrameConfig	KEYWORD1
+M5Stamp_UWBTxResult	KEYWORD1
+M5Stamp_UWBRxResult	KEYWORD1
+M5Stamp_UWBRangeConfig	KEYWORD1
+M5Stamp_UWBDSRangeConfig	KEYWORD1
+M5Stamp_UWBRangeResult	KEYWORD1
+M5Stamp_UWBDSRangeResult	KEYWORD1
+M5Stamp_UWBResponderResult	KEYWORD1
+M5Stamp_UWBDSResponderResult	KEYWORD1
+M5Stamp_UWBError	KEYWORD1
+M5Stamp_UWBChannel	KEYWORD1
+M5Stamp_UWBDataRate	KEYWORD1
+M5Stamp_UWBPreambleLength	KEYWORD1
+M5Stamp_UWBPacSize	KEYWORD1
+M5Stamp_UWBSfdType	KEYWORD1
+M5Stamp_UWBStsMode	KEYWORD1
+M5Stamp_UWBPdoaMode	KEYWORD1
+
+begin	KEYWORD2
+init	KEYWORD2
+hardReset	KEYWORD2
+deviceId	KEYWORD2
+readRawDeviceId	KEYWORD2
+chipName	KEYWORD2
+sendFrame	KEYWORD2
+receiveFrame	KEYWORD2
+requestRange	KEYWORD2
+respondRange	KEYWORD2
+requestDSRange	KEYWORD2
+respondDSRange	KEYWORD2
+lastError	KEYWORD2
+lastErrorName	KEYWORD2
+isConnected	KEYWORD2
+isInitialized	KEYWORD2
+config	KEYWORD2
+
+M5STAMP_UWB_OK	LITERAL1
+M5STAMP_UWB_QM33120_DEVICE_ID	LITERAL1
+
+
