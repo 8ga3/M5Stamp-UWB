@@ -14,6 +14,8 @@ extern "C" {
 #include "qm33120w_sdk/deca_interface.h"
 extern const struct dwt_driver_s dw3720_driver;
 
+static portMUX_TYPE g_deca_mutex = portMUX_INITIALIZER_UNLOCKED;
+
 /* Platform delay hooks required by the imported Qorvo dwt driver. */
 void deca_sleep(unsigned int time_ms)
 {
@@ -25,16 +27,16 @@ void deca_usleep(unsigned long time_us)
     delayMicroseconds(time_us);
 }
 
-/* The driver uses these hooks around short critical sections. */
+/* Protect SDK read-modify-write sections without globally disabling all CPU interrupts. */
 decaIrqStatus_t decamutexon(void)
 {
-    noInterrupts();
+    portENTER_CRITICAL(&g_deca_mutex);
     return 0;
 }
 
 void decamutexoff(decaIrqStatus_t)
 {
-    interrupts();
+    portEXIT_CRITICAL(&g_deca_mutex);
 }
 }
 
@@ -53,12 +55,46 @@ struct M5Stamp_UWB::Impl {
 
 M5Stamp_UWB* M5Stamp_UWB::_active = nullptr;
 
+static uint16_t pacSymbols(M5Stamp_UWBPacSize pacSize)
+{
+    switch (pacSize) {
+        case M5Stamp_UWBPacSize::Pac4:
+            return 4;
+        case M5Stamp_UWBPacSize::Pac16:
+            return 16;
+        case M5Stamp_UWBPacSize::Pac32:
+            return 32;
+        case M5Stamp_UWBPacSize::Pac8:
+        default:
+            return 8;
+    }
+}
+
+static uint16_t sfdSymbols(M5Stamp_UWBSfdType sfdType)
+{
+    switch (sfdType) {
+        case M5Stamp_UWBSfdType::DW16:
+            return 16;
+        case M5Stamp_UWBSfdType::IEEE4A:
+        case M5Stamp_UWBSfdType::IEEE4Z:
+        case M5Stamp_UWBSfdType::DW8:
+        default:
+            return 8;
+    }
+}
+
 static uint16_t makeSfdTimeout(const M5Stamp_UWBPHYConfig& phy)
 {
     if (phy.sfdTimeout != 0) {
         return phy.sfdTimeout;
     }
-    return static_cast<uint16_t>(static_cast<uint16_t>(phy.preambleLength) + 1 + 8 - 8);
+
+    const uint16_t preambleSymbols = static_cast<uint16_t>(phy.preambleLength);
+    const uint16_t sfdLength       = sfdSymbols(phy.sfdType);
+    const uint16_t pacLength       = pacSymbols(phy.pacSize);
+
+    // Qorvo recommended formula: SFD timeout = preamble length + 1 + SFD length - PAC length.
+    return static_cast<uint16_t>(preambleSymbols + 1 + sfdLength - pacLength);
 }
 
 static dwt_uwb_bit_rate_e toDwtDataRate(M5Stamp_UWBDataRate dataRate)
@@ -325,9 +361,7 @@ M5Stamp_UWB::M5Stamp_UWB() : _impl(new Impl())
 
 M5Stamp_UWB::~M5Stamp_UWB()
 {
-    if (_active == this) {
-        _active = nullptr;
-    }
+    end();
     delete _impl;
 }
 
@@ -392,6 +426,36 @@ bool M5Stamp_UWB::begin(const M5Stamp_UWBConfig& config, const M5Stamp_UWBPHYCon
     }
 
     return init(phy);
+}
+
+void M5Stamp_UWB::end()
+{
+    if (_impl == nullptr) {
+        return;
+    }
+
+    const bool wasActive = (_active == this);
+    const bool hadDriver = wasActive || _impl->connected || _impl->initialized;
+
+    if (wasActive && _impl->initialized) {
+        dwt_forcetrxoff();
+    }
+
+    if (wasActive) {
+        _active = nullptr;
+    }
+
+    if (hadDriver && (_impl->config.pin_cs != M5STAMP_UWB_PIN_UNUSED)) {
+        digitalWrite(_impl->config.pin_cs, HIGH);
+    }
+    if (hadDriver && (_impl->config.pin_wakeup != M5STAMP_UWB_PIN_UNUSED)) {
+        digitalWrite(_impl->config.pin_wakeup, LOW);
+    }
+
+    _impl->connected   = false;
+    _impl->initialized = false;
+    _impl->device_id   = 0;
+    setError(M5Stamp_UWBError::Ok);
 }
 
 bool M5Stamp_UWB::init(const M5Stamp_UWBPHYConfig& phy)

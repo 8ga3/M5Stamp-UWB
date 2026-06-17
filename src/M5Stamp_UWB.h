@@ -27,6 +27,11 @@ public:
                const M5Stamp_UWBPHYConfig& phy = M5Stamp_UWBPHYConfig());
 
     /**
+     * @brief Stop UWB activity and release the active driver instance.
+     */
+    void end();
+
+    /**
      * @brief Reconfigure the UWB PHY after begin().
      */
     bool init(const M5Stamp_UWBPHYConfig& phy = M5Stamp_UWBPHYConfig());

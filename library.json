@@ -5,7 +5,7 @@
     "keywords": "m5stack, stamp, uwb, qm33120w, dw3720, ranging",
     "repository": {
         "type": "git",
-        "url": "https://github.com/m5stack/M5Stamp_UWB.git"
+        "url": "https://github.com/m5stack/M5Stamp-UWB.git"
     },
     "authors": [
         {

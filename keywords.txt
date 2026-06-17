@@ -24,6 +24,7 @@ M5Stamp_UWBStsMode	KEYWORD1
 M5Stamp_UWBPdoaMode	KEYWORD1
 
 begin	KEYWORD2
+end	KEYWORD2
 init	KEYWORD2
 hardReset	KEYWORD2
 deviceId	KEYWORD2
