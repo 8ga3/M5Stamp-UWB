@@ -19,6 +19,8 @@ class M5Stamp_UWB {
 public:
     M5Stamp_UWB();
     ~M5Stamp_UWB();
+    M5Stamp_UWB(const M5Stamp_UWB&)            = delete;
+    M5Stamp_UWB& operator=(const M5Stamp_UWB&) = delete;
 
     /**
      * @brief Initialize GPIO/SPI, probe the UWB chip, and apply the PHY configuration.

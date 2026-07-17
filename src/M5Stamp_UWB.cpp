@@ -309,6 +309,13 @@ static uint64_t readRxTimestamp64()
     return get40le(ts);
 }
 
+static constexpr uint16_t SHORT_ADDRESS_HEADER_LEN = 9;
+
+static uint16_t shortAddressFrameLength(size_t payloadLength)
+{
+    return static_cast<uint16_t>(SHORT_ADDRESS_HEADER_LEN + payloadLength + FCS_LEN);
+}
+
 static void buildShortAddressFrame(uint8_t* frame, uint8_t sequence, uint16_t panId, uint16_t src, uint16_t dst,
                                    const uint8_t* payload, size_t payloadLength)
 {
@@ -323,9 +330,7 @@ static void buildShortAddressFrame(uint8_t* frame, uint8_t sequence, uint16_t pa
 
 static bool parseShortAddressFrame(const uint8_t* frame, uint16_t frameLen, M5Stamp_UWBRxResult& result)
 {
-    static constexpr uint16_t headerLen = 9;
-
-    if ((frame == nullptr) || (frameLen < (headerLen + FCS_LEN))) {
+    if ((frame == nullptr) || (frameLen < (SHORT_ADDRESS_HEADER_LEN + FCS_LEN))) {
         return false;
     }
     if ((frame[0] != 0x41) || (frame[1] != 0x88)) {
@@ -336,15 +341,18 @@ static bool parseShortAddressFrame(const uint8_t* frame, uint16_t frameLen, M5St
     result.panId         = get16le(&frame[3]);
     result.dst           = get16le(&frame[5]);
     result.src           = get16le(&frame[7]);
-    result.payloadLength = frameLen - headerLen - FCS_LEN;
+    result.payloadLength = frameLen - SHORT_ADDRESS_HEADER_LEN - FCS_LEN;
     result.frameLength   = frameLen;
     result.ranging       = false;
     return true;
 }
 
-static bool payloadMatches(const uint8_t* frame, uint16_t frameLen, const char* payload, size_t payloadLength)
+static bool payloadMatches(const uint8_t* frame, uint16_t frameLen, const char* payload, size_t prefixLength,
+                           size_t expectedPayloadLength)
 {
-    return (frameLen >= (9 + payloadLength + FCS_LEN)) && (memcmp(&frame[9], payload, payloadLength) == 0);
+    return (frame != nullptr) && (payload != nullptr) && (prefixLength <= expectedPayloadLength) &&
+           (frameLen == shortAddressFrameLength(expectedPayloadLength)) &&
+           (memcmp(&frame[SHORT_ADDRESS_HEADER_LEN], payload, prefixLength) == 0);
 }
 
 static M5Stamp_UWBError rxStatusToError(uint32_t status)
@@ -353,6 +361,28 @@ static M5Stamp_UWBError rxStatusToError(uint32_t status)
         return M5Stamp_UWBError::RxTimeout;
     }
     return M5Stamp_UWBError::RxError;
+}
+
+static void stopRadioAndClearStatus(uint32_t statusMask)
+{
+    dwt_forcetrxoff();
+    dwt_writesysstatuslo(statusMask);
+}
+
+static void stopRadioAndClearRxStatus()
+{
+    stopRadioAndClearStatus(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_GOOD);
+}
+
+static void stopRadioAndClearTxStatus()
+{
+    stopRadioAndClearStatus(DWT_INT_TXFRS_BIT_MASK);
+}
+
+static void stopRadioAndClearIoStatus()
+{
+    stopRadioAndClearStatus(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_GOOD |
+                            DWT_INT_TXFRS_BIT_MASK);
 }
 
 M5Stamp_UWB::M5Stamp_UWB() : _impl(new Impl())
@@ -367,16 +397,39 @@ M5Stamp_UWB::~M5Stamp_UWB()
 
 bool M5Stamp_UWB::begin(const M5Stamp_UWBConfig& config, const M5Stamp_UWBPHYConfig& phy)
 {
+    if ((_active != nullptr) && (_active != this)) {
+        setError(M5Stamp_UWBError::Busy);
+        return false;
+    }
+
+    if ((config.spi == nullptr) || (config.pin_cs == M5STAMP_UWB_PIN_UNUSED)) {
+        setError(M5Stamp_UWBError::InvalidConfig);
+        return false;
+    }
+
     _impl->config      = config;
     _impl->connected   = false;
     _impl->initialized = false;
     _impl->device_id   = 0;
     _active            = this;
 
-    if ((_impl->config.spi == nullptr) || !validCs()) {
-        setError(M5Stamp_UWBError::InvalidConfig);
+    auto cleanupBeginFailure = [this]() {
+        const M5Stamp_UWBError error = _impl->last_error;
+        if (_active == this) {
+            _active = nullptr;
+        }
+        if (_impl->config.pin_cs != M5STAMP_UWB_PIN_UNUSED) {
+            digitalWrite(_impl->config.pin_cs, HIGH);
+        }
+        if (_impl->config.pin_wakeup != M5STAMP_UWB_PIN_UNUSED) {
+            digitalWrite(_impl->config.pin_wakeup, LOW);
+        }
+        _impl->connected   = false;
+        _impl->initialized = false;
+        _impl->device_id   = 0;
+        setError(error);
         return false;
-    }
+    };
 
     pinMode(_impl->config.pin_cs, OUTPUT);
     digitalWrite(_impl->config.pin_cs, HIGH);
@@ -422,10 +475,14 @@ bool M5Stamp_UWB::begin(const M5Stamp_UWBConfig& config, const M5Stamp_UWBPHYCon
     }
 
     if (!probe()) {
-        return false;
+        return cleanupBeginFailure();
     }
 
-    return init(phy);
+    if (!init(phy)) {
+        return cleanupBeginFailure();
+    }
+
+    return true;
 }
 
 void M5Stamp_UWB::end()
@@ -606,10 +663,10 @@ M5Stamp_UWBTxResult M5Stamp_UWB::sendFrame(const uint8_t* payload, size_t length
     set16le(&txFrame[7], frame.src);
     memcpy(&txFrame[9], payload, length);
 
-    dwt_forcetrxoff();
-    dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+    stopRadioAndClearIoStatus();
 
     if (dwt_writetxdata(static_cast<uint16_t>(frameLen), txFrame, 0) != DWT_SUCCESS) {
+        stopRadioAndClearTxStatus();
         result.error = M5Stamp_UWBError::TxDataFailed;
         setError(result.error);
         return result;
@@ -617,6 +674,7 @@ M5Stamp_UWBTxResult M5Stamp_UWB::sendFrame(const uint8_t* payload, size_t length
     dwt_writetxfctrl(static_cast<uint16_t>(frameLen + FCS_LEN), 0, frame.ranging ? 1 : 0);
 
     if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
+        stopRadioAndClearTxStatus();
         result.error = M5Stamp_UWBError::TxStartFailed;
         setError(result.error);
         return result;
@@ -637,7 +695,7 @@ M5Stamp_UWBTxResult M5Stamp_UWB::sendFrame(const uint8_t* payload, size_t length
         delay(1);
     }
 
-    dwt_forcetrxoff();
+    stopRadioAndClearTxStatus();
     result.error = M5Stamp_UWBError::TxTimeout;
     setError(result.error);
     return result;
@@ -658,11 +716,10 @@ M5Stamp_UWBRxResult M5Stamp_UWB::receiveFrame(uint8_t* payload, size_t payloadSi
         return result;
     }
 
-    dwt_forcetrxoff();
-    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_GOOD |
-                         DWT_INT_TXFRS_BIT_MASK);
+    stopRadioAndClearIoStatus();
 
     if (dwt_rxenable(DWT_START_RX_IMMEDIATE) != DWT_SUCCESS) {
+        stopRadioAndClearRxStatus();
         result.error = M5Stamp_UWBError::RxStartFailed;
         setError(result.error);
         return result;
@@ -709,8 +766,7 @@ M5Stamp_UWBRxResult M5Stamp_UWB::receiveFrame(uint8_t* payload, size_t payloadSi
         }
 
         if ((status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) != 0) {
-            dwt_forcetrxoff();
-            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+            stopRadioAndClearRxStatus();
             result.elapsedMs = millis() - startMs;
             result.error     = rxStatusToError(status);
             setError(result.error);
@@ -719,7 +775,7 @@ M5Stamp_UWBRxResult M5Stamp_UWB::receiveFrame(uint8_t* payload, size_t payloadSi
         delay(1);
     }
 
-    dwt_forcetrxoff();
+    stopRadioAndClearRxStatus();
     result.elapsedMs = millis() - startMs;
     result.error     = M5Stamp_UWBError::RxTimeout;
     setError(result.error);
@@ -744,20 +800,20 @@ M5Stamp_UWBRangeResult M5Stamp_UWB::requestRange(const M5Stamp_UWBRangeConfig& r
     buildShortAddressFrame(pollFrame, pollSeq, range.panId, range.initiatorAddress, range.responderAddress, pollPayload,
                            sizeof(pollPayload));
 
-    dwt_forcetrxoff();
-    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_GOOD |
-                         DWT_INT_TXFRS_BIT_MASK);
+    stopRadioAndClearIoStatus();
     dwt_setpreambledetecttimeout(0);
     dwt_setrxaftertxdelay(range.responseRxAfterTxDelayUus);
     dwt_setrxtimeout(range.rxTimeoutUus);
 
     if (dwt_writetxdata(sizeof(pollFrame), pollFrame, 0) != DWT_SUCCESS) {
+        stopRadioAndClearIoStatus();
         result.error = M5Stamp_UWBError::TxDataFailed;
         setError(result.error);
         return result;
     }
     dwt_writetxfctrl(sizeof(pollFrame) + FCS_LEN, 0, 1);
     if (dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED) != DWT_SUCCESS) {
+        stopRadioAndClearIoStatus();
         result.error = M5Stamp_UWBError::TxStartFailed;
         setError(result.error);
         return result;
@@ -777,9 +833,11 @@ M5Stamp_UWBRangeResult M5Stamp_UWB::requestRange(const M5Stamp_UWBRangeConfig& r
             dwt_writesysstatuslo(SYS_STATUS_ALL_RX_GOOD | DWT_INT_TXFRS_BIT_MASK);
 
             M5Stamp_UWBRxResult parsed;
-            if (!parseShortAddressFrame(rawFrame, frameLen, parsed) || !payloadMatches(rawFrame, frameLen, "TWR", 3) ||
-                (parsed.sequence != pollSeq) || (parsed.panId != range.panId) ||
-                (parsed.src != range.responderAddress) || (parsed.dst != range.initiatorAddress) || (frameLen < 20)) {
+            if (!parseShortAddressFrame(rawFrame, frameLen, parsed) ||
+                !payloadMatches(rawFrame, frameLen, "TWR", 3, 11) || (parsed.sequence != pollSeq) ||
+                (parsed.panId != range.panId) || (parsed.src != range.responderAddress) ||
+                (parsed.dst != range.initiatorAddress)) {
+                stopRadioAndClearRxStatus();
                 result.sequence  = parsed.sequence;
                 result.elapsedMs = millis() - startMs;
                 result.error     = M5Stamp_UWBError::RangeFrameMismatch;
@@ -814,8 +872,7 @@ M5Stamp_UWBRangeResult M5Stamp_UWB::requestRange(const M5Stamp_UWBRangeConfig& r
         }
 
         if ((status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) != 0) {
-            dwt_forcetrxoff();
-            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+            stopRadioAndClearRxStatus();
             result.elapsedMs = millis() - startMs;
             result.error     = rxStatusToError(status);
             setError(result.error);
@@ -824,7 +881,7 @@ M5Stamp_UWBRangeResult M5Stamp_UWB::requestRange(const M5Stamp_UWBRangeConfig& r
         delay(1);
     }
 
-    dwt_forcetrxoff();
+    stopRadioAndClearRxStatus();
     result.elapsedMs = millis() - startMs;
     result.error     = M5Stamp_UWBError::RxTimeout;
     setError(result.error);
@@ -842,14 +899,13 @@ M5Stamp_UWBResponderResult M5Stamp_UWB::respondRange(const M5Stamp_UWBRangeConfi
         return result;
     }
 
-    dwt_forcetrxoff();
-    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_GOOD |
-                         DWT_INT_TXFRS_BIT_MASK);
+    stopRadioAndClearIoStatus();
     dwt_setpreambledetecttimeout(0);
     dwt_setrxaftertxdelay(0);
     dwt_setrxtimeout(0);
 
     if (dwt_rxenable(DWT_START_RX_IMMEDIATE) != DWT_SUCCESS) {
+        stopRadioAndClearRxStatus();
         result.error = M5Stamp_UWBError::RxStartFailed;
         setError(result.error);
         return result;
@@ -870,8 +926,9 @@ M5Stamp_UWBResponderResult M5Stamp_UWB::respondRange(const M5Stamp_UWBRangeConfi
 
             M5Stamp_UWBRxResult parsed;
             if (!parseShortAddressFrame(pollFrame, frameLen, parsed) ||
-                !payloadMatches(pollFrame, frameLen, "TWP", 3) || (parsed.panId != range.panId) ||
+                !payloadMatches(pollFrame, frameLen, "TWP", 3, 3) || (parsed.panId != range.panId) ||
                 (parsed.dst != range.responderAddress)) {
+                stopRadioAndClearRxStatus();
                 result.sequence  = parsed.sequence;
                 result.requester = parsed.src;
                 result.elapsedMs = millis() - startMs;
@@ -898,12 +955,14 @@ M5Stamp_UWBResponderResult M5Stamp_UWB::respondRange(const M5Stamp_UWBRangeConfi
 
             dwt_setdelayedtrxtime(respTxTime);
             if (dwt_writetxdata(sizeof(respFrame), respFrame, 0) != DWT_SUCCESS) {
+                stopRadioAndClearTxStatus();
                 result.error = M5Stamp_UWBError::TxDataFailed;
                 setError(result.error);
                 return result;
             }
             dwt_writetxfctrl(sizeof(respFrame) + FCS_LEN, 0, 1);
             if (dwt_starttx(DWT_START_TX_DELAYED) != DWT_SUCCESS) {
+                stopRadioAndClearTxStatus();
                 result.error = M5Stamp_UWBError::TxStartFailed;
                 setError(result.error);
                 return result;
@@ -925,15 +984,14 @@ M5Stamp_UWBResponderResult M5Stamp_UWB::respondRange(const M5Stamp_UWBRangeConfi
                 delay(1);
             }
 
-            dwt_forcetrxoff();
+            stopRadioAndClearTxStatus();
             result.error = M5Stamp_UWBError::TxTimeout;
             setError(result.error);
             return result;
         }
 
         if ((status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) != 0) {
-            dwt_forcetrxoff();
-            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+            stopRadioAndClearRxStatus();
             result.elapsedMs = millis() - startMs;
             result.error     = rxStatusToError(status);
             setError(result.error);
@@ -942,7 +1000,7 @@ M5Stamp_UWBResponderResult M5Stamp_UWB::respondRange(const M5Stamp_UWBRangeConfi
         delay(1);
     }
 
-    dwt_forcetrxoff();
+    stopRadioAndClearRxStatus();
     result.elapsedMs = millis() - startMs;
     result.error     = M5Stamp_UWBError::RxTimeout;
     setError(result.error);
@@ -967,20 +1025,20 @@ M5Stamp_UWBDSRangeResult M5Stamp_UWB::requestDSRange(const M5Stamp_UWBDSRangeCon
     buildShortAddressFrame(pollFrame, pollSeq, range.panId, range.initiatorAddress, range.responderAddress, pollPayload,
                            sizeof(pollPayload));
 
-    dwt_forcetrxoff();
-    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_GOOD |
-                         DWT_INT_TXFRS_BIT_MASK);
+    stopRadioAndClearIoStatus();
     dwt_setpreambledetecttimeout(0);
     dwt_setrxaftertxdelay(range.responseRxAfterTxDelayUus);
     dwt_setrxtimeout(range.rxTimeoutUus);
 
     if (dwt_writetxdata(sizeof(pollFrame), pollFrame, 0) != DWT_SUCCESS) {
+        stopRadioAndClearIoStatus();
         result.error = M5Stamp_UWBError::TxDataFailed;
         setError(result.error);
         return result;
     }
     dwt_writetxfctrl(sizeof(pollFrame) + FCS_LEN, 0, 1);
     if (dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED) != DWT_SUCCESS) {
+        stopRadioAndClearIoStatus();
         result.error = M5Stamp_UWBError::TxStartFailed;
         setError(result.error);
         return result;
@@ -992,7 +1050,8 @@ M5Stamp_UWBDSRangeResult M5Stamp_UWB::requestDSRange(const M5Stamp_UWBDSRangeCon
     while ((millis() - startMs) < range.hostTimeoutMs) {
         const uint32_t status = dwt_readsysstatuslo();
         if ((status & DWT_INT_RXFCG_BIT_MASK) != 0) {
-            respLen = dwt_getframelength(nullptr);
+            uint8_t rangingBit = 0;
+            respLen            = dwt_getframelength(&rangingBit);
             if (respLen > sizeof(respFrame)) {
                 respLen = sizeof(respFrame);
             }
@@ -1001,8 +1060,7 @@ M5Stamp_UWBDSRangeResult M5Stamp_UWB::requestDSRange(const M5Stamp_UWBDSRangeCon
             break;
         }
         if ((status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) != 0) {
-            dwt_forcetrxoff();
-            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+            stopRadioAndClearRxStatus();
             result.elapsedMs = millis() - startMs;
             result.error     = rxStatusToError(status);
             setError(result.error);
@@ -1012,9 +1070,10 @@ M5Stamp_UWBDSRangeResult M5Stamp_UWB::requestDSRange(const M5Stamp_UWBDSRangeCon
     }
 
     M5Stamp_UWBRxResult parsed;
-    if (!parseShortAddressFrame(respFrame, respLen, parsed) || !payloadMatches(respFrame, respLen, "DWR", 3) ||
+    if (!parseShortAddressFrame(respFrame, respLen, parsed) || !payloadMatches(respFrame, respLen, "DWR", 3, 11) ||
         (parsed.sequence != pollSeq) || (parsed.panId != range.panId) || (parsed.src != range.responderAddress) ||
-        (parsed.dst != range.initiatorAddress) || (respLen < 20)) {
+        (parsed.dst != range.initiatorAddress)) {
+        stopRadioAndClearRxStatus();
         result.sequence  = parsed.sequence;
         result.elapsedMs = millis() - startMs;
         result.error     = respLen == 0 ? M5Stamp_UWBError::RxTimeout : M5Stamp_UWBError::RangeFrameMismatch;
@@ -1040,12 +1099,14 @@ M5Stamp_UWBDSRangeResult M5Stamp_UWB::requestDSRange(const M5Stamp_UWBDSRangeCon
     dwt_setrxaftertxdelay(range.resultRxAfterFinalTxDelayUus);
     dwt_setrxtimeout(range.rxTimeoutUus);
     if (dwt_writetxdata(sizeof(finalFrame), finalFrame, 0) != DWT_SUCCESS) {
+        stopRadioAndClearIoStatus();
         result.error = M5Stamp_UWBError::TxDataFailed;
         setError(result.error);
         return result;
     }
     dwt_writetxfctrl(sizeof(finalFrame) + FCS_LEN, 0, 1);
     if (dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED) != DWT_SUCCESS) {
+        stopRadioAndClearIoStatus();
         result.error = M5Stamp_UWBError::TxStartFailed;
         setError(result.error);
         return result;
@@ -1057,7 +1118,8 @@ M5Stamp_UWBDSRangeResult M5Stamp_UWB::requestDSRange(const M5Stamp_UWBDSRangeCon
     while ((millis() - resultStartMs) < range.hostTimeoutMs) {
         const uint32_t status = dwt_readsysstatuslo();
         if ((status & DWT_INT_RXFCG_BIT_MASK) != 0) {
-            distLen = dwt_getframelength(nullptr);
+            uint8_t rangingBit = 0;
+            distLen            = dwt_getframelength(&rangingBit);
             if (distLen > sizeof(distFrame)) {
                 distLen = sizeof(distFrame);
             }
@@ -1066,8 +1128,7 @@ M5Stamp_UWBDSRangeResult M5Stamp_UWB::requestDSRange(const M5Stamp_UWBDSRangeCon
             break;
         }
         if ((status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) != 0) {
-            dwt_forcetrxoff();
-            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+            stopRadioAndClearRxStatus();
             result.sequence  = pollSeq;
             result.elapsedMs = millis() - startMs;
             result.error     = rxStatusToError(status);
@@ -1077,9 +1138,10 @@ M5Stamp_UWBDSRangeResult M5Stamp_UWB::requestDSRange(const M5Stamp_UWBDSRangeCon
         delay(1);
     }
 
-    if (!parseShortAddressFrame(distFrame, distLen, parsed) || !payloadMatches(distFrame, distLen, "DWD", 3) ||
+    if (!parseShortAddressFrame(distFrame, distLen, parsed) || !payloadMatches(distFrame, distLen, "DWD", 3, 7) ||
         (parsed.sequence != pollSeq) || (parsed.panId != range.panId) || (parsed.src != range.responderAddress) ||
-        (parsed.dst != range.initiatorAddress) || (distLen < 16)) {
+        (parsed.dst != range.initiatorAddress)) {
+        stopRadioAndClearRxStatus();
         result.sequence  = parsed.sequence;
         result.elapsedMs = millis() - startMs;
         result.error     = distLen == 0 ? M5Stamp_UWBError::RxTimeout : M5Stamp_UWBError::RangeFrameMismatch;
@@ -1110,14 +1172,13 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
         return result;
     }
 
-    dwt_forcetrxoff();
-    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_GOOD |
-                         DWT_INT_TXFRS_BIT_MASK);
+    stopRadioAndClearIoStatus();
     dwt_setpreambledetecttimeout(0);
     dwt_setrxaftertxdelay(0);
     dwt_setrxtimeout(0);
 
     if (dwt_rxenable(DWT_START_RX_IMMEDIATE) != DWT_SUCCESS) {
+        stopRadioAndClearRxStatus();
         result.error = M5Stamp_UWBError::RxStartFailed;
         setError(result.error);
         return result;
@@ -1130,7 +1191,8 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
     while ((millis() - startMs) < range.hostTimeoutMs) {
         const uint32_t status = dwt_readsysstatuslo();
         if ((status & DWT_INT_RXFCG_BIT_MASK) != 0) {
-            pollLen = dwt_getframelength(nullptr);
+            uint8_t rangingBit = 0;
+            pollLen            = dwt_getframelength(&rangingBit);
             if (pollLen > sizeof(pollFrame)) {
                 pollLen = sizeof(pollFrame);
             }
@@ -1139,8 +1201,7 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
             break;
         }
         if ((status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) != 0) {
-            dwt_forcetrxoff();
-            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+            stopRadioAndClearRxStatus();
             result.elapsedMs = millis() - startMs;
             result.error     = rxStatusToError(status);
             setError(result.error);
@@ -1149,8 +1210,9 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
         delay(1);
     }
 
-    if (!parseShortAddressFrame(pollFrame, pollLen, parsed) || !payloadMatches(pollFrame, pollLen, "DWP", 3) ||
+    if (!parseShortAddressFrame(pollFrame, pollLen, parsed) || !payloadMatches(pollFrame, pollLen, "DWP", 3, 3) ||
         (parsed.panId != range.panId) || (parsed.dst != range.responderAddress)) {
+        stopRadioAndClearRxStatus();
         result.sequence  = parsed.sequence;
         result.requester = parsed.src;
         result.elapsedMs = millis() - startMs;
@@ -1175,12 +1237,14 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
     dwt_setrxaftertxdelay(range.finalRxAfterResponseTxDelayUus);
     dwt_setrxtimeout(range.rxTimeoutUus);
     if (dwt_writetxdata(sizeof(respFrame), respFrame, 0) != DWT_SUCCESS) {
+        stopRadioAndClearIoStatus();
         result.error = M5Stamp_UWBError::TxDataFailed;
         setError(result.error);
         return result;
     }
     dwt_writetxfctrl(sizeof(respFrame) + FCS_LEN, 0, 1);
     if (dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED) != DWT_SUCCESS) {
+        stopRadioAndClearIoStatus();
         result.error = M5Stamp_UWBError::TxStartFailed;
         setError(result.error);
         return result;
@@ -1192,7 +1256,8 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
     while ((millis() - finalStartMs) < range.hostTimeoutMs) {
         const uint32_t status = dwt_readsysstatuslo();
         if ((status & DWT_INT_RXFCG_BIT_MASK) != 0) {
-            finalLen = dwt_getframelength(nullptr);
+            uint8_t rangingBit = 0;
+            finalLen           = dwt_getframelength(&rangingBit);
             if (finalLen > sizeof(finalFrame)) {
                 finalLen = sizeof(finalFrame);
             }
@@ -1201,8 +1266,7 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
             break;
         }
         if ((status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) != 0) {
-            dwt_forcetrxoff();
-            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+            stopRadioAndClearRxStatus();
             result.sequence  = parsed.sequence;
             result.requester = parsed.src;
             result.elapsedMs = millis() - startMs;
@@ -1214,9 +1278,11 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
     }
 
     M5Stamp_UWBRxResult finalParsed;
-    if (!parseShortAddressFrame(finalFrame, finalLen, finalParsed) || !payloadMatches(finalFrame, finalLen, "DWF", 3) ||
+    if (!parseShortAddressFrame(finalFrame, finalLen, finalParsed) ||
+        !payloadMatches(finalFrame, finalLen, "DWF", 3, 15) || (finalParsed.sequence != parsed.sequence) ||
         (finalParsed.panId != range.panId) || (finalParsed.src != parsed.src) ||
-        (finalParsed.dst != range.responderAddress) || (finalLen < 24)) {
+        (finalParsed.dst != range.responderAddress)) {
+        stopRadioAndClearRxStatus();
         result.sequence  = finalParsed.sequence;
         result.requester = parsed.src;
         result.elapsedMs = millis() - startMs;
@@ -1267,17 +1333,23 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
         }
         dwt_writetxfctrl(sizeof(distFrame) + FCS_LEN, 0, 0);
         if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
+            stopRadioAndClearTxStatus();
             continue;
         }
 
+        bool txDone              = false;
         const uint32_t txStartMs = millis();
         while ((millis() - txStartMs) < 20) {
             if ((dwt_readsysstatuslo() & DWT_INT_TXFRS_BIT_MASK) != 0) {
                 dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+                txDone = true;
                 sentCount++;
                 break;
             }
             delay(1);
+        }
+        if (!txDone) {
+            stopRadioAndClearTxStatus();
         }
         if (i + 1 < repeatCount) {
             delay(range.resultRepeatGapMs);
@@ -1347,6 +1419,8 @@ const char* M5Stamp_UWB::lastErrorName() const
             return "RANGE_FRAME_MISMATCH";
         case M5Stamp_UWBError::InvalidArgument:
             return "INVALID_ARGUMENT";
+        case M5Stamp_UWBError::Busy:
+            return "BUSY";
         default:
             return "UNKNOWN";
     }

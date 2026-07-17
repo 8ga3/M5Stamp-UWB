@@ -64,6 +64,7 @@ enum class M5Stamp_UWBError : int8_t {
     RangeTimestampInvalid,
     RangeFrameMismatch,
     InvalidArgument,
+    Busy,
 };
 
 enum class M5Stamp_UWBDataRate : uint8_t {
