@@ -92,7 +92,7 @@ static bool initUwb()
     config.pin_sck    = UWB_PIN_SCK;
     config.pin_miso   = UWB_PIN_MISO;
     config.pin_mosi   = UWB_PIN_MOSI;
-    // Default PHY uses channel 5 with the recommended settings from the library.
+    // Default PHY uses channel 9 with the recommended settings from the library.
     M5Stamp_UWBPHYConfig phy;
 
     if (!uwb.begin(config, phy)) {

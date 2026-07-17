@@ -120,7 +120,7 @@ enum class M5Stamp_UWBPdoaMode : uint8_t {
  * configuration is used.
  */
 struct M5Stamp_UWBPHYConfig {
-    M5Stamp_UWBChannel channel               = M5Stamp_UWBChannel::Channel5;
+    M5Stamp_UWBChannel channel               = M5Stamp_UWBChannel::Channel9;
     M5Stamp_UWBPreambleLength preambleLength = M5Stamp_UWBPreambleLength::Len128;
     M5Stamp_UWBPacSize pacSize               = M5Stamp_UWBPacSize::Pac8;
     uint8_t txPreambleCode                   = 9;
