@@ -7,10 +7,6 @@
 M5Stamp-UWB is an Arduino library for the M5Stack Stamp UWB. 
 The defaulthost configuration is for Stamp C5.
 
-## Related Link
-
-- [GitHub Repository](https://github.com/m5stack/M5Stamp-UWB)
-
 ## License
 
 - [M5Stamp-UWB - MIT](LICENSE)
