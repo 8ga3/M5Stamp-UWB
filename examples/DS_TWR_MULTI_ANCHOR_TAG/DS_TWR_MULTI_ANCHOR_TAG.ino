@@ -26,9 +26,15 @@ static constexpr int UWB_PIN_SCK    = 12;
 // PAN_ID separates this example UWB network from other 802.15.4/UWB traffic.
 static constexpr uint16_t PAN_ID = 0xDECA;
 
-// Short addresses used inside the example frames. Keep TAG and ANCHOR different.
-static constexpr uint16_t TAG_SHORT_ADDR    = 0x0001;
-static constexpr uint16_t ANCHOR_SHORT_ADDR = 0x0002;
+// Short address of this tag. 0x01xx is reserved for anchors, so tag and anchor
+// addresses never collide.
+static constexpr uint16_t TAG_SHORT_ADDR = 0x0001;
+
+// Anchors polled in this order, one exchange each per cycle. DS_TWR_MULTI_ANCHOR
+// derives its address as 0x0100 + ANCHOR_ID, so keep this list in sync with the
+// anchors that are actually powered on.
+static constexpr uint16_t ANCHOR_SHORT_ADDR[] = {0x0101, 0x0102};
+static constexpr uint8_t ANCHOR_COUNT         = sizeof(ANCHOR_SHORT_ADDR) / sizeof(ANCHOR_SHORT_ADDR[0]);
 
 // Common RX/host timeout. The UWB timeout is in UWB microseconds (uus), while
 // hostTimeoutMs limits how long the MCU polls the driver status registers.
@@ -46,26 +52,27 @@ static constexpr uint32_t FINAL_TX_DLY_UUS                   = 1800;
 static constexpr uint32_t FINAL_RX_AFTER_RESPONSE_TX_DLY_UUS = 500;
 static constexpr uint32_t RESULT_RX_AFTER_FINAL_TX_DLY_UUS   = 500;
 
-// ANCHOR repeats the Result frame to make the last step easier to receive.
-static constexpr uint8_t RESULT_REPEAT_COUNT   = 3;
+// Result repeat settings belong to the responder. They are kept here so both
+// sketches share one configuration block, and match DS_TWR_MULTI_ANCHOR.
+static constexpr uint8_t RESULT_REPEAT_COUNT   = 1;
 static constexpr uint32_t RESULT_REPEAT_GAP_MS = 3;
 
 M5Stamp_UWB uwb;
 static bool uwbReady = false;
+// TAG starts one polling cycle every POLL_INTERVAL_MS and waits ANCHOR_GAP_MS
+// between two anchors, which gives the previous anchor time to leave TX and
+// return to RX before the next Poll goes out.
+static constexpr uint32_t POLL_INTERVAL_MS = 200;
+static constexpr uint32_t ANCHOR_GAP_MS    = 20;
+static uint32_t lastPollMs                 = 0;
+static uint32_t pollSequence               = 0;
 
-// ANCHOR logs every ANCHOR_LOG_INTERVAL successful responses. This keeps the
-// responder mostly silent so Serial output does not disturb the RX hot path.
-static constexpr uint32_t ANCHOR_LOG_INTERVAL = 20;
-
-static uint32_t anchorRespCount = 0;
-static uint32_t anchorFailCount = 0;
-
-static M5Stamp_UWBDSRangeConfig makeDSRangeConfig()
+static M5Stamp_UWBDSRangeConfig makeDSRangeConfig(uint16_t anchorAddress)
 {
     M5Stamp_UWBDSRangeConfig range;
     range.panId                          = PAN_ID;
     range.initiatorAddress               = TAG_SHORT_ADDR;
-    range.responderAddress               = ANCHOR_SHORT_ADDR;
+    range.responderAddress               = anchorAddress;
     range.responseRxAfterTxDelayUus      = RESPONSE_RX_AFTER_TX_DLY_UUS;
     range.responseTxDelayUus             = RESPONSE_TX_DLY_UUS;
     range.finalTxDelayUus                = FINAL_TX_DLY_UUS;
@@ -111,35 +118,38 @@ static bool initUwb()
     return true;
 }
 
-static void runAnchorRole()
+static void logRange(uint16_t anchorAddress, const M5Stamp_UWBDSRangeResult& result)
 {
-    const M5Stamp_UWBDSResponderResult result = uwb.respondDSRange(makeDSRangeConfig());
-    const char* logPrefix                     = "DS_RESP_STAT";
+    // The anchor id is the low byte of the short address, so the log lines stay
+    // readable when ANCHOR_SHORT_ADDR[] is reordered.
+    const unsigned anchorId = static_cast<unsigned>(anchorAddress & 0xFF);
 
-    if (!result.success) {
-        if (result.error == M5Stamp_UWBError::RxTimeout) {
-            return;
-        }
-
-        anchorFailCount++;
-        if ((anchorFailCount % ANCHOR_LOG_INTERVAL) == 0) {
-            Serial.printf("%s,count=%lu,fail=%lu,last=FAIL,error=%s\n", logPrefix,
-                          static_cast<unsigned long>(anchorRespCount), static_cast<unsigned long>(anchorFailCount),
-                          uwb.lastErrorName());
-        }
+    if (result.success) {
+        Serial.printf("MULTI_RANGE,cycle=%lu,anchor_id=%u,address=0x%04X,result=OK,distance_mm=%ld,distance_m=%.3f\n",
+                      static_cast<unsigned long>(pollSequence), anchorId, anchorAddress,
+                      static_cast<long>(result.distanceMm), result.distanceM);
         return;
     }
 
-    anchorRespCount++;
-    if ((anchorRespCount % ANCHOR_LOG_INTERVAL) != 0) {
+    Serial.printf("MULTI_RANGE,cycle=%lu,anchor_id=%u,address=0x%04X,result=FAIL,error=%s\n",
+                  static_cast<unsigned long>(pollSequence), anchorId, anchorAddress, uwb.lastErrorName());
+}
+
+static void runTagRole()
+{
+    if ((millis() - lastPollMs) < POLL_INTERVAL_MS) {
         return;
     }
+    lastPollMs = millis();
 
-    Serial.printf(
-        "%s,count=%lu,fail=%lu,last=OK,seq=%u,requester=0x%X,distance_mm=%ld,distance_m=%.3f,elapsed_ms=%lu\n",
-        logPrefix, static_cast<unsigned long>(anchorRespCount), static_cast<unsigned long>(anchorFailCount),
-        result.sequence, result.requester, static_cast<long>(result.distanceMm), result.distanceM,
-        static_cast<unsigned long>(result.elapsedMs));
+    // One cycle ranges every anchor in turn. A missing anchor only costs the RX
+    // frame-wait timeout, so the remaining anchors are still polled.
+    pollSequence++;
+    for (uint8_t index = 0; index < ANCHOR_COUNT; ++index) {
+        const uint16_t anchorAddress = ANCHOR_SHORT_ADDR[index];
+        logRange(anchorAddress, uwb.requestDSRange(makeDSRangeConfig(anchorAddress)));
+        delay(ANCHOR_GAP_MS);
+    }
 }
 
 void setup()
@@ -147,9 +157,14 @@ void setup()
     Serial.begin(115200);
     delay(1000);
 
-    Serial.printf("M5Stamp UWB DS-TWR ANCHOR\n");
-    Serial.printf("ROLE,mode=ANCHOR\n");
+    Serial.printf("M5Stamp UWB DS-TWR MULTI-ANCHOR TAG\n");
+    Serial.printf("ROLE,mode=TAG,address=0x%04X,anchors=%u\n", TAG_SHORT_ADDR, static_cast<unsigned>(ANCHOR_COUNT));
     Serial.printf("TWR_MODE,mode=DS-TWR\n");
+    for (uint8_t index = 0; index < ANCHOR_COUNT; ++index) {
+        const uint16_t anchorAddress = ANCHOR_SHORT_ADDR[index];
+        Serial.printf("ANCHOR_LIST,anchor_id=%u,address=0x%04X\n", static_cast<unsigned>(anchorAddress & 0xFF),
+                      anchorAddress);
+    }
     uwbReady = initUwb();
     Serial.printf("TEST_START,result=%s\n", uwbReady ? "OK" : "FAIL");
 }
@@ -160,5 +175,5 @@ void loop()
         delay(1000);
         return;
     }
-    runAnchorRole();
+    runTagRole();
 }

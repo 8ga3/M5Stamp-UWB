@@ -26,9 +26,14 @@ static constexpr int UWB_PIN_SCK    = 12;
 // PAN_ID separates this example UWB network from other 802.15.4/UWB traffic.
 static constexpr uint16_t PAN_ID = 0xDECA;
 
-// Short addresses used inside the example frames. Keep TAG and ANCHOR different.
+// ANCHOR_ID must be unique, so flash this sketch once per anchor with a different
+// value. The tag's ANCHOR_SHORT_ADDR[] list must contain 0x0100 + ANCHOR_ID.
+static constexpr uint8_t ANCHOR_ID = 1;
+
+// Short addresses used inside the example frames. 0x01xx is reserved for anchors,
+// so tag and anchor addresses never collide.
 static constexpr uint16_t TAG_SHORT_ADDR    = 0x0001;
-static constexpr uint16_t ANCHOR_SHORT_ADDR = 0x0002;
+static constexpr uint16_t ANCHOR_SHORT_ADDR = 0x0100 + ANCHOR_ID;
 
 // Common RX/host timeout. The UWB timeout is in UWB microseconds (uus), while
 // hostTimeoutMs limits how long the MCU polls the driver status registers.
@@ -46,19 +51,24 @@ static constexpr uint32_t FINAL_TX_DLY_UUS                   = 1800;
 static constexpr uint32_t FINAL_RX_AFTER_RESPONSE_TX_DLY_UUS = 500;
 static constexpr uint32_t RESULT_RX_AFTER_FINAL_TX_DLY_UUS   = 500;
 
-// ANCHOR repeats the Result frame to make the last step easier to receive.
-static constexpr uint8_t RESULT_REPEAT_COUNT   = 3;
+// ANCHOR sends the Result frame once. Every repeat keeps this anchor transmitting
+// while the tag is already polling the next one.
+static constexpr uint8_t RESULT_REPEAT_COUNT   = 1;
 static constexpr uint32_t RESULT_REPEAT_GAP_MS = 3;
 
 M5Stamp_UWB uwb;
 static bool uwbReady = false;
-
-// ANCHOR logs every ANCHOR_LOG_INTERVAL successful responses. This keeps the
-// responder mostly silent so Serial output does not disturb the RX hot path.
-static constexpr uint32_t ANCHOR_LOG_INTERVAL = 20;
-
-static uint32_t anchorRespCount = 0;
-static uint32_t anchorFailCount = 0;
+// ANCHOR prints one statistics line every STATS_INTERVAL_MS instead of logging
+// each event. Serial output blocks the RX hot path, and every anchor also hears
+// the 4 * (N - 1) frames per cycle that belong to the other anchors' exchanges.
+static constexpr uint32_t STATS_INTERVAL_MS = 5000;
+// ok = exchanges served, ignored = frames for another anchor, fail = real errors.
+static uint32_t okCount       = 0;
+static uint32_t ignoredCount  = 0;
+static uint32_t failCount     = 0;
+static int32_t lastDistanceMm = 0;
+static const char* lastFail   = "NONE";
+static uint32_t lastStatsMs   = 0;
 
 static M5Stamp_UWBDSRangeConfig makeDSRangeConfig()
 {
@@ -114,32 +124,27 @@ static bool initUwb()
 static void runAnchorRole()
 {
     const M5Stamp_UWBDSResponderResult result = uwb.respondDSRange(makeDSRangeConfig());
-    const char* logPrefix                     = "DS_RESP_STAT";
 
-    if (!result.success) {
-        if (result.error == M5Stamp_UWBError::RxTimeout) {
-            return;
-        }
-
-        anchorFailCount++;
-        if ((anchorFailCount % ANCHOR_LOG_INTERVAL) == 0) {
-            Serial.printf("%s,count=%lu,fail=%lu,last=FAIL,error=%s\n", logPrefix,
-                          static_cast<unsigned long>(anchorRespCount), static_cast<unsigned long>(anchorFailCount),
-                          uwb.lastErrorName());
-        }
-        return;
+    if (result.success) {
+        okCount++;
+        lastDistanceMm = result.distanceMm;
+    } else if (result.error == M5Stamp_UWBError::RangeFrameMismatch) {
+        // Frame from another anchor's exchange. Normal here, so only count it.
+        ignoredCount++;
+    } else if (result.error != M5Stamp_UWBError::RxTimeout) {
+        failCount++;
+        lastFail = uwb.lastErrorName();
     }
 
-    anchorRespCount++;
-    if ((anchorRespCount % ANCHOR_LOG_INTERVAL) != 0) {
+    if ((millis() - lastStatsMs) < STATS_INTERVAL_MS) {
         return;
     }
+    lastStatsMs = millis();
 
-    Serial.printf(
-        "%s,count=%lu,fail=%lu,last=OK,seq=%u,requester=0x%X,distance_mm=%ld,distance_m=%.3f,elapsed_ms=%lu\n",
-        logPrefix, static_cast<unsigned long>(anchorRespCount), static_cast<unsigned long>(anchorFailCount),
-        result.sequence, result.requester, static_cast<long>(result.distanceMm), result.distanceM,
-        static_cast<unsigned long>(result.elapsedMs));
+    Serial.printf("MULTI_RESP_STAT,anchor_id=%u,address=0x%04X,ok=%lu,ignored=%lu,fail=%lu,distance_mm=%ld,last=%s\n",
+                  static_cast<unsigned>(ANCHOR_ID), ANCHOR_SHORT_ADDR, static_cast<unsigned long>(okCount),
+                  static_cast<unsigned long>(ignoredCount), static_cast<unsigned long>(failCount),
+                  static_cast<long>(lastDistanceMm), lastFail);
 }
 
 void setup()
@@ -147,10 +152,12 @@ void setup()
     Serial.begin(115200);
     delay(1000);
 
-    Serial.printf("M5Stamp UWB DS-TWR ANCHOR\n");
-    Serial.printf("ROLE,mode=ANCHOR\n");
+    Serial.printf("M5Stamp UWB DS-TWR MULTI-ANCHOR ANCHOR\n");
+    Serial.printf("ROLE,mode=ANCHOR,anchor_id=%u,address=0x%04X\n", static_cast<unsigned>(ANCHOR_ID),
+                  ANCHOR_SHORT_ADDR);
     Serial.printf("TWR_MODE,mode=DS-TWR\n");
-    uwbReady = initUwb();
+    uwbReady    = initUwb();
+    lastStatsMs = millis();
     Serial.printf("TEST_START,result=%s\n", uwbReady ? "OK" : "FAIL");
 }
 
