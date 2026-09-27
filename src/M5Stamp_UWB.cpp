@@ -379,6 +379,58 @@ static void stopRadioAndClearTxStatus()
     stopRadioAndClearStatus(DWT_INT_TXFRS_BIT_MASK);
 }
 
+/* Fork: waiting between SYS_STATUS reads. See M5STAMP_UWB_WAIT_MODE in
+ * M5Stamp_UWB_Types.h. */
+
+/* Only the RX outcome events drive the IRQ line. TXFRS is left out on purpose:
+ * it stays set from the poll TX until the response is handled, which would hold
+ * the line high and swallow the rising edge of RXFCG. */
+static constexpr uint32_t kIrqEventMask =
+    DWT_INT_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR;
+
+static volatile TaskHandle_t g_irq_waiter = nullptr;
+static bool g_irq_enabled                 = false;
+
+static void IRAM_ATTR onUwbIrq()
+{
+    TaskHandle_t waiter = g_irq_waiter;
+    if (waiter == nullptr) {
+        return;
+    }
+    BaseType_t woken = pdFALSE;
+    vTaskNotifyGiveFromISR(waiter, &woken);
+    if (woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+static void waitForRadioEvent()
+{
+#if M5STAMP_UWB_WAIT_MODE == 1
+    // Spin: the caller re-reads SYS_STATUS right away.
+#elif M5STAMP_UWB_WAIT_MODE == 2
+    if (g_irq_enabled) {
+        g_irq_waiter = xTaskGetCurrentTaskHandle();
+        ulTaskNotifyTake(pdTRUE, 1);
+        return;
+    }
+    delay(1);
+#else
+    delay(1);
+#endif
+}
+
+/* Time left until a delayed TX, in microseconds, read just before dwt_starttx().
+ * Both values are in the DX_TIME / SYS_TIME unit of 256 DTU (about 4.006 ns,
+ * 249.6 per microsecond). Negative means the host was already late. */
+#if M5STAMP_UWB_MEASURE_MARGIN
+static int32_t delayedTxMarginUs(uint32_t txTimeHi32)
+{
+    const int32_t ticks = static_cast<int32_t>(txTimeHi32 - dwt_readsystimestamphi32());
+    return static_cast<int32_t>((static_cast<int64_t>(ticks) * 10) / 2496);
+}
+#endif
+
 static void stopRadioAndClearIoStatus()
 {
     stopRadioAndClearStatus(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_GOOD |
@@ -498,6 +550,12 @@ void M5Stamp_UWB::end()
         dwt_forcetrxoff();
     }
 
+    if (g_irq_enabled && (_impl->config.pin_irq != M5STAMP_UWB_PIN_UNUSED)) {
+        detachInterrupt(digitalPinToInterrupt(_impl->config.pin_irq));
+    }
+    g_irq_enabled = false;
+    g_irq_waiter  = nullptr;
+
     if (wasActive) {
         _active = nullptr;
     }
@@ -553,6 +611,17 @@ bool M5Stamp_UWB::init(const M5Stamp_UWBPHYConfig& phy)
     if (resolvedPHY.enableLnaPa) {
         dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE);
     }
+
+#if M5STAMP_UWB_WAIT_MODE == 2
+    // Fork: route the RX outcome events to the IRQ pin. dwt_initialise() above
+    // resets SYS_ENABLE, so this has to follow every init().
+    if (_impl->config.pin_irq != M5STAMP_UWB_PIN_UNUSED) {
+        dwt_setinterrupt(kIrqEventMask, 0, DWT_ENABLE_INT_ONLY);
+        g_irq_waiter = xTaskGetCurrentTaskHandle();
+        attachInterrupt(digitalPinToInterrupt(_impl->config.pin_irq), onUwbIrq, RISING);
+        g_irq_enabled = true;
+    }
+#endif
 
     _impl->initialized = true;
     setError(M5Stamp_UWBError::Ok);
@@ -692,7 +761,7 @@ M5Stamp_UWBTxResult M5Stamp_UWB::sendFrame(const uint8_t* payload, size_t length
             setError(M5Stamp_UWBError::Ok);
             return result;
         }
-        delay(1);
+        waitForRadioEvent();
     }
 
     stopRadioAndClearTxStatus();
@@ -772,7 +841,7 @@ M5Stamp_UWBRxResult M5Stamp_UWB::receiveFrame(uint8_t* payload, size_t payloadSi
             setError(result.error);
             return result;
         }
-        delay(1);
+        waitForRadioEvent();
     }
 
     stopRadioAndClearRxStatus();
@@ -878,7 +947,7 @@ M5Stamp_UWBRangeResult M5Stamp_UWB::requestRange(const M5Stamp_UWBRangeConfig& r
             setError(result.error);
             return result;
         }
-        delay(1);
+        waitForRadioEvent();
     }
 
     stopRadioAndClearRxStatus();
@@ -981,7 +1050,7 @@ M5Stamp_UWBResponderResult M5Stamp_UWB::respondRange(const M5Stamp_UWBRangeConfi
                     setError(M5Stamp_UWBError::Ok);
                     return result;
                 }
-                delay(1);
+                waitForRadioEvent();
             }
 
             stopRadioAndClearTxStatus();
@@ -997,7 +1066,7 @@ M5Stamp_UWBResponderResult M5Stamp_UWB::respondRange(const M5Stamp_UWBRangeConfi
             setError(result.error);
             return result;
         }
-        delay(1);
+        waitForRadioEvent();
     }
 
     stopRadioAndClearRxStatus();
@@ -1066,7 +1135,7 @@ M5Stamp_UWBDSRangeResult M5Stamp_UWB::requestDSRange(const M5Stamp_UWBDSRangeCon
             setError(result.error);
             return result;
         }
-        delay(1);
+        waitForRadioEvent();
     }
 
     M5Stamp_UWBRxResult parsed;
@@ -1105,6 +1174,9 @@ M5Stamp_UWBDSRangeResult M5Stamp_UWB::requestDSRange(const M5Stamp_UWBDSRangeCon
         return result;
     }
     dwt_writetxfctrl(sizeof(finalFrame) + FCS_LEN, 0, 1);
+#if M5STAMP_UWB_MEASURE_MARGIN
+    result.txMarginUs = delayedTxMarginUs(finalTxTime);
+#endif
     if (dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED) != DWT_SUCCESS) {
         stopRadioAndClearIoStatus();
         result.error = M5Stamp_UWBError::TxStartFailed;
@@ -1135,7 +1207,7 @@ M5Stamp_UWBDSRangeResult M5Stamp_UWB::requestDSRange(const M5Stamp_UWBDSRangeCon
             setError(result.error);
             return result;
         }
-        delay(1);
+        waitForRadioEvent();
     }
 
     if (!parseShortAddressFrame(distFrame, distLen, parsed) || !payloadMatches(distFrame, distLen, "DWD", 3, 7) ||
@@ -1207,7 +1279,7 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
             setError(result.error);
             return result;
         }
-        delay(1);
+        waitForRadioEvent();
     }
 
     if (!parseShortAddressFrame(pollFrame, pollLen, parsed) || !payloadMatches(pollFrame, pollLen, "DWP", 3, 3) ||
@@ -1243,6 +1315,9 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
         return result;
     }
     dwt_writetxfctrl(sizeof(respFrame) + FCS_LEN, 0, 1);
+#if M5STAMP_UWB_MEASURE_MARGIN
+    result.txMarginUs = delayedTxMarginUs(respTxTime);
+#endif
     if (dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED) != DWT_SUCCESS) {
         stopRadioAndClearIoStatus();
         result.error = M5Stamp_UWBError::TxStartFailed;
@@ -1274,7 +1349,7 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
             setError(result.error);
             return result;
         }
-        delay(1);
+        waitForRadioEvent();
     }
 
     M5Stamp_UWBRxResult finalParsed;
@@ -1346,7 +1421,7 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
                 sentCount++;
                 break;
             }
-            delay(1);
+            waitForRadioEvent();
         }
         if (!txDone) {
             stopRadioAndClearTxStatus();

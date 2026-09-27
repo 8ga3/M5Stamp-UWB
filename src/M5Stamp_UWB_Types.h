@@ -16,6 +16,39 @@
 
 #define M5STAMP_UWB_OK 0
 
+// Fork marker: the DS-TWR results carry txMarginUs. Sketches test this to stay
+// buildable against the upstream library.
+#define M5STAMP_UWB_HAS_TX_MARGIN 1
+#define M5STAMP_UWB_TX_MARGIN_UNKNOWN INT32_MIN
+
+/*
+ * Fork: how the status polling loops wait between SYS_STATUS reads.
+ *
+ * Upstream sleeps with delay(1), which parks the task until the next FreeRTOS
+ * tick. The host then notices a received frame up to one tick late, and that
+ * eats into the budget of the delayed TX scheduled from the RX timestamp. How
+ * late depends on the phase between the exchange and the tick, which is fixed
+ * by the boot timing of each firmware image, so with a tight finalTxDelayUus
+ * one build almost never fails and the next fails nearly every exchange.
+ *
+ *   0: delay(1) (upstream behaviour)
+ *   1: busy-poll SYS_STATUS without sleeping
+ *   2: sleep on a task notification given from the IRQ pin ISR (default).
+ *      Falls back to delay(1) when pin_irq is M5STAMP_UWB_PIN_UNUSED, and the
+ *      one-tick timeout keeps the loop working if an edge is ever missed.
+ *
+ * Override with a build flag, e.g. -D M5STAMP_UWB_WAIT_MODE=0.
+ */
+#ifndef M5STAMP_UWB_WAIT_MODE
+#define M5STAMP_UWB_WAIT_MODE 2
+#endif
+
+// Fork: set to 0 to drop the extra SYS_TIME read that feeds txMarginUs, so the
+// delayed TX path matches upstream exactly.
+#ifndef M5STAMP_UWB_MEASURE_MARGIN
+#define M5STAMP_UWB_MEASURE_MARGIN 1
+#endif
+
 static constexpr uint32_t M5STAMP_UWB_QM33120_DEVICE_ID = 0xDECA0314;
 
 /**
@@ -231,6 +264,9 @@ struct M5Stamp_UWBDSRangeResult {
     float distanceM        = 0.0f;
     uint32_t elapsedMs     = 0;
     M5Stamp_UWBError error = M5Stamp_UWBError::Ok;
+    // Fork: time left before the delayed final TX when dwt_starttx() was called.
+    // M5STAMP_UWB_TX_MARGIN_UNKNOWN if the exchange ended before that point.
+    int32_t txMarginUs = M5STAMP_UWB_TX_MARGIN_UNKNOWN;
 };
 
 /**
@@ -255,4 +291,6 @@ struct M5Stamp_UWBDSResponderResult {
     float distanceM        = 0.0f;
     uint32_t elapsedMs     = 0;
     M5Stamp_UWBError error = M5Stamp_UWBError::Ok;
+    // Fork: time left before the delayed response TX, as in M5Stamp_UWBDSRangeResult.
+    int32_t txMarginUs = M5STAMP_UWB_TX_MARGIN_UNKNOWN;
 };
