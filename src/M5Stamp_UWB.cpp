@@ -596,6 +596,12 @@ bool M5Stamp_UWB::init(const M5Stamp_UWBPHYConfig& phy)
         return false;
     }
 
+    // Fork: switch to spi_fast_hz here. The driver only calls setfastrate() from
+    // its MCPS init path, which this library does not use, so upstream keeps
+    // running every transfer at spi_slow_hz (2 MHz by default) and spi_fast_hz
+    // has no effect. A register access then takes about 30 us instead of a few.
+    setSpiRate(_impl->config.spi_fast_hz);
+
     dwt_config_t dwtConfig = toDwtConfig(resolvedPHY);
     if (dwt_configure(&dwtConfig) != DWT_SUCCESS) {
         _impl->initialized = false;
