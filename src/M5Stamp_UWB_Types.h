@@ -21,6 +21,10 @@
 #define M5STAMP_UWB_HAS_TX_MARGIN 1
 #define M5STAMP_UWB_TX_MARGIN_UNKNOWN INT32_MIN
 
+// Fork marker: init() checks that the chip really drives the IRQ line and fails
+// with M5Stamp_UWBError::IrqLineFault if it does not. See irqCheck().
+#define M5STAMP_UWB_HAS_IRQ_CHECK 1
+
 /*
  * Fork: how the status polling loops wait between SYS_STATUS reads.
  *
@@ -98,6 +102,20 @@ enum class M5Stamp_UWBError : int8_t {
     RangeFrameMismatch,
     InvalidArgument,
     Busy,
+    IrqLineFault,  //!< Fork: the IRQ line is not driven by the chip (open or shorted wire).
+};
+
+/**
+ * @brief Fork: levels read on the IRQ line by the check in init().
+ *
+ * idleLevel is read with every interrupt source disabled and the host pull-up on;
+ * a working line reads 0. activeLevel is read with a pending TIMER0 event routed
+ * to the line and the host pull-down on; a working line reads 1. -1 means the
+ * level was not read (the check did not run, or the timer event never came).
+ */
+struct M5Stamp_UWBIrqCheck {
+    int8_t idleLevel   = -1;
+    int8_t activeLevel = -1;
 };
 
 enum class M5Stamp_UWBDataRate : uint8_t {

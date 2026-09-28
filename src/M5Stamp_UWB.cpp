@@ -51,6 +51,7 @@ struct M5Stamp_UWB::Impl {
     uint8_t tx_sequence         = 0;
     uint16_t tx_antenna_delay   = 16385;
     M5Stamp_UWBError last_error = M5Stamp_UWBError::Ok;
+    M5Stamp_UWBIrqCheck irq_check;
 };
 
 M5Stamp_UWB* M5Stamp_UWB::_active = nullptr;
@@ -431,6 +432,68 @@ static int32_t delayedTxMarginUs(uint32_t txTimeHi32)
 }
 #endif
 
+#if M5STAMP_UWB_WAIT_MODE == 2
+/* Fork: check that the chip drives the IRQ line, before relying on it.
+ *
+ * With the line open (a bad solder joint was found on one board), the pin just
+ * floats: no rising edge ever arrives, every wait falls back to the one-tick
+ * timeout, and delayed TXs fail intermittently depending on how late the host
+ * notices each frame. That looks like a timing problem rather than a broken
+ * board, so fail init() instead of running on.
+ *
+ * The line is read in both states the chip should drive, each time against a
+ * host pull that would win if nothing drove the line:
+ *   - no interrupt source enabled, pull-up on: must read 0
+ *   - a pending TIMER0 event enabled, pull-down on: must read 1
+ * The timer raises the event without transmitting anything. If it never fires,
+ * the second read is skipped rather than blamed on the line. */
+static void checkIrqLine(int8_t pin, M5Stamp_UWBIrqCheck& check)
+{
+    static constexpr uint32_t kSettleUs       = 100;
+    static constexpr uint32_t kTimerTicks     = 60;  // XTAL/64 = 0.6 MHz, so about 100 us
+    static constexpr uint32_t kTimerTimeoutUs = 5000;
+
+    check = M5Stamp_UWBIrqCheck{};
+
+    dwt_setinterrupt(0, 0, DWT_ENABLE_INT_ONLY);
+    pinMode(pin, INPUT_PULLUP);
+    delayMicroseconds(kSettleUs);
+    check.idleLevel = static_cast<int8_t>(digitalRead(pin));
+
+    // dwt_setinterrupt() clears the status bits it enables, so route TIMER0 to
+    // the line first and start the timer afterwards.
+    dwt_setinterrupt(DWT_INT_TIMER0_BIT_MASK, 0, DWT_ENABLE_INT_ONLY);
+    dwt_timer_cfg_t timer = {};
+    timer.timer           = DWT_TIMER0;
+    timer.timer_div       = DWT_XTAL_DIV64;
+    timer.timer_mode      = DWT_TIM_SINGLE;
+    dwt_configure_timer(&timer);
+    dwt_set_timer_expiration(DWT_TIMER0, kTimerTicks);
+    dwt_timer_enable(DWT_TIMER0);
+
+    const uint32_t startUs = micros();
+    bool fired             = false;
+    while (!fired && ((micros() - startUs) < kTimerTimeoutUs)) {
+        fired = (dwt_readsysstatuslo() & DWT_INT_TIMER0_BIT_MASK) != 0;
+    }
+    if (fired) {
+        pinMode(pin, INPUT_PULLDOWN);
+        delayMicroseconds(kSettleUs);
+        check.activeLevel = static_cast<int8_t>(digitalRead(pin));
+    }
+
+    dwt_setinterrupt(0, 0, DWT_ENABLE_INT_ONLY);
+    dwt_timers_reset();
+    dwt_writesysstatuslo(DWT_INT_TIMER0_BIT_MASK);
+    pinMode(pin, INPUT);
+}
+
+static bool irqLineWorks(const M5Stamp_UWBIrqCheck& check)
+{
+    return (check.idleLevel == LOW) && (check.activeLevel != LOW);
+}
+#endif
+
 static void stopRadioAndClearIoStatus()
 {
     stopRadioAndClearStatus(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_GOOD |
@@ -622,6 +685,12 @@ bool M5Stamp_UWB::init(const M5Stamp_UWBPHYConfig& phy)
     // Fork: route the RX outcome events to the IRQ pin. dwt_initialise() above
     // resets SYS_ENABLE, so this has to follow every init().
     if (_impl->config.pin_irq != M5STAMP_UWB_PIN_UNUSED) {
+        checkIrqLine(_impl->config.pin_irq, _impl->irq_check);
+        if (!irqLineWorks(_impl->irq_check)) {
+            _impl->initialized = false;
+            setError(M5Stamp_UWBError::IrqLineFault);
+            return false;
+        }
         dwt_setinterrupt(kIrqEventMask, 0, DWT_ENABLE_INT_ONLY);
         g_irq_waiter = xTaskGetCurrentTaskHandle();
         attachInterrupt(digitalPinToInterrupt(_impl->config.pin_irq), onUwbIrq, RISING);
@@ -1446,6 +1515,11 @@ M5Stamp_UWBDSResponderResult M5Stamp_UWB::respondDSRange(const M5Stamp_UWBDSRang
     return result;
 }
 
+M5Stamp_UWBIrqCheck M5Stamp_UWB::irqCheck() const
+{
+    return _impl->irq_check;
+}
+
 bool M5Stamp_UWB::isConnected() const
 {
     return _impl->connected;
@@ -1502,6 +1576,8 @@ const char* M5Stamp_UWB::lastErrorName() const
             return "INVALID_ARGUMENT";
         case M5Stamp_UWBError::Busy:
             return "BUSY";
+        case M5Stamp_UWBError::IrqLineFault:
+            return "IRQ_LINE_FAULT";
         default:
             return "UNKNOWN";
     }

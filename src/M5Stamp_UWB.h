@@ -59,6 +59,11 @@ public:
     const char* chipName() const;
 
     /**
+     * @brief Fork: IRQ line levels read by the last init(). See M5Stamp_UWBIrqCheck.
+     */
+    M5Stamp_UWBIrqCheck irqCheck() const;
+
+    /**
      * @brief Send a short-address IEEE 802.15.4 frame with a user payload.
      */
     M5Stamp_UWBTxResult sendFrame(const uint8_t* payload, size_t length,
