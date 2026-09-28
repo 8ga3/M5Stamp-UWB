@@ -1554,6 +1554,18 @@ void M5Stamp_UWB::wakeupDeviceWithIo()
     }
 }
 
+/* Fork: SPI transfers go out in bursts instead of one SPIClass::transfer(uint8_t)
+ * call per byte. Each of those calls pays the driver's per-transfer setup, which
+ * costs several times the 0.4 us a byte takes on the wire at 20 MHz, and the
+ * register accesses between receiving the response and scheduling the delayed
+ * final TX add up to a large share of finalTxDelayUus.
+ *
+ * The bulk calls of Arduino-ESP32 access their buffers as 32-bit words, so the
+ * stream (header, then body or dummy bytes) is staged through a word-aligned
+ * buffer of at most one hardware FIFO (64 bytes) at a time. CS stays low across
+ * the bursts, so the chip sees one continuous transaction. */
+static constexpr uint32_t kSpiBurstBytes = 64;
+
 int32_t M5Stamp_UWB::readFromSpiImpl(uint16_t header_length, uint8_t* header_buffer, uint16_t read_length,
                                      uint8_t* read_buffer)
 {
@@ -1561,13 +1573,25 @@ int32_t M5Stamp_UWB::readFromSpiImpl(uint16_t header_length, uint8_t* header_buf
         return DWT_ERROR;
     }
 
+    alignas(4) uint8_t burst[kSpiBurstBytes];
+    const uint32_t total = static_cast<uint32_t>(header_length) + read_length;
+
     _impl->config.spi->beginTransaction(_impl->spi_settings);
     digitalWrite(_impl->config.pin_cs, LOW);
-    for (uint16_t i = 0; i < header_length; ++i) {
-        _impl->config.spi->transfer(header_buffer[i]);
-    }
-    for (uint16_t i = 0; i < read_length; ++i) {
-        read_buffer[i] = _impl->config.spi->transfer(0x00);
+    for (uint32_t pos = 0; pos < total;) {
+        const uint32_t n = ((total - pos) < kSpiBurstBytes) ? (total - pos) : kSpiBurstBytes;
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t p = pos + i;
+            burst[i]         = (p < header_length) ? header_buffer[p] : 0x00;
+        }
+        _impl->config.spi->transferBytes(burst, burst, n);
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t p = pos + i;
+            if (p >= header_length) {
+                read_buffer[p - header_length] = burst[i];
+            }
+        }
+        pos += n;
     }
     digitalWrite(_impl->config.pin_cs, HIGH);
     _impl->config.spi->endTransaction();
@@ -1582,16 +1606,26 @@ int32_t M5Stamp_UWB::writeToSpiImpl(uint16_t header_length, const uint8_t* heade
         return DWT_ERROR;
     }
 
+    alignas(4) uint8_t burst[kSpiBurstBytes];
+    const uint32_t bodyEnd = static_cast<uint32_t>(header_length) + body_length;
+    const uint32_t total   = bodyEnd + ((crc8 != nullptr) ? 1 : 0);
+
     _impl->config.spi->beginTransaction(_impl->spi_settings);
     digitalWrite(_impl->config.pin_cs, LOW);
-    for (uint16_t i = 0; i < header_length; ++i) {
-        _impl->config.spi->transfer(header_buffer[i]);
-    }
-    for (uint16_t i = 0; i < body_length; ++i) {
-        _impl->config.spi->transfer(body_buffer != nullptr ? body_buffer[i] : 0x00);
-    }
-    if (crc8 != nullptr) {
-        _impl->config.spi->transfer(*crc8);
+    for (uint32_t pos = 0; pos < total;) {
+        const uint32_t n = ((total - pos) < kSpiBurstBytes) ? (total - pos) : kSpiBurstBytes;
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t p = pos + i;
+            if (p < header_length) {
+                burst[i] = header_buffer[p];
+            } else if (p < bodyEnd) {
+                burst[i] = (body_buffer != nullptr) ? body_buffer[p - header_length] : 0x00;
+            } else {
+                burst[i] = *crc8;
+            }
+        }
+        _impl->config.spi->writeBytes(burst, n);
+        pos += n;
     }
     digitalWrite(_impl->config.pin_cs, HIGH);
     _impl->config.spi->endTransaction();
